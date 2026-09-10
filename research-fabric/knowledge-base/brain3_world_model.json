@@ -53,8 +53,68 @@
       "last_seen": "2026-09-10T18:52:11.999903",
       "source": "research_fabric",
       "query": "MCP protocol vs A2A protocol"
+    },
+    "055afbc23c5c": {
+      "first_seen": "2026-09-10T18:53:55.474828",
+      "last_seen": "2026-09-10T18:53:55.474833",
+      "source": "research_fabric",
+      "query": "AI agent orchestration frameworks"
+    },
+    "183ee0646569": {
+      "first_seen": "2026-09-10T18:53:55.474835",
+      "last_seen": "2026-09-10T18:53:55.474837",
+      "source": "research_fabric",
+      "query": "AI agent orchestration frameworks"
+    },
+    "3d66c514c7d0": {
+      "first_seen": "2026-09-10T18:53:55.474839",
+      "last_seen": "2026-09-10T18:53:55.474840",
+      "source": "research_fabric",
+      "query": "AI agent orchestration frameworks"
+    },
+    "cc57afa619f6": {
+      "first_seen": "2026-09-10T18:53:55.474865",
+      "last_seen": "2026-09-10T18:53:55.474866",
+      "source": "research_fabric",
+      "query": "AI agent orchestration frameworks"
+    },
+    "072965fef9a5": {
+      "first_seen": "2026-09-10T18:53:55.474867",
+      "last_seen": "2026-09-10T18:53:55.474869",
+      "source": "research_fabric",
+      "query": "AI agent orchestration frameworks"
+    },
+    "77a54d717965": {
+      "first_seen": "2026-09-10T18:53:55.474870",
+      "last_seen": "2026-09-10T18:53:55.474871",
+      "source": "research_fabric",
+      "query": "AI agent orchestration frameworks"
+    },
+    "23a5203b2a3b": {
+      "first_seen": "2026-09-10T18:53:55.474873",
+      "last_seen": "2026-09-10T18:53:55.474874",
+      "source": "research_fabric",
+      "query": "AI agent orchestration frameworks"
+    },
+    "0f59b3bdbe94": {
+      "first_seen": "2026-09-10T18:53:55.474877",
+      "last_seen": "2026-09-10T18:53:55.474879",
+      "source": "research_fabric",
+      "query": "AI agent orchestration frameworks"
+    },
+    "1c371a2a818a": {
+      "first_seen": "2026-09-10T18:53:55.474880",
+      "last_seen": "2026-09-10T18:53:55.474882",
+      "source": "research_fabric",
+      "query": "AI agent orchestration frameworks"
+    },
+    "f663c484e8a8": {
+      "first_seen": "2026-09-10T18:53:55.474883",
+      "last_seen": "2026-09-10T18:53:55.474884",
+      "source": "research_fabric",
+      "query": "AI agent orchestration frameworks"
     }
   },
   "signals": [],
-  "updated_at": "2026-09-10T18:52:11.999908"
+  "updated_at": "2026-09-10T18:53:55.474887"
 }

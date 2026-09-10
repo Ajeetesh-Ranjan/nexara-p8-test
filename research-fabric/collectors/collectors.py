@@ -57,8 +57,9 @@ class ArxivCollector:
             )
         try:
             search = arxiv.Search(query=f"cat:cs.AI AND {query}", max_results=max_results)
+            client = arxiv.Client()
             items = []
-            for result in search.results():
+            for result in client.results(search):
                 content = f"{result.title}\n\n{result.summary}"
                 sha = hashlib.sha256(content.encode()).hexdigest()[:16]
                 items.append(CollectedItem(

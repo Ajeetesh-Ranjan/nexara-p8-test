@@ -11,3 +11,12 @@
 
 ## [2026-09-10] update | query 'Research: Investigate: transformer architecture'
 - /home/ajeetesh/nexara-p8/research-fabric/knowledge-base/llm-wiki/queries/research-investigate-transformer-architecture.md
+
+## [2026-09-10] update | query 'Research: AI agent orchestration frameworks 2026'
+- /home/ajeetesh/nexara-p8/research-fabric/knowledge-base/llm-wiki/queries/research-ai-agent-orchestration-frameworks-2026.md
+
+## [2026-09-10] update | query 'Research: AI agent orchestration frameworks 2026'
+- /home/ajeetesh/nexara-p8/research-fabric/knowledge-base/llm-wiki/queries/research-ai-agent-orchestration-frameworks-2026.md
+
+## [2026-09-10] update | query 'Research: AI agent orchestration frameworks'
+- /home/ajeetesh/nexara-p8/research-fabric/knowledge-base/llm-wiki/queries/research-ai-agent-orchestration-frameworks.md
