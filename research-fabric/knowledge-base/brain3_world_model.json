@@ -1,0 +1,60 @@
+{
+  "entities": {
+    "1c1c52ef3799": {
+      "first_seen": "2026-09-10T18:49:41.030340",
+      "last_seen": "2026-09-10T18:52:11.999879",
+      "source": "research_fabric",
+      "query": "MCP protocol vs A2A protocol"
+    },
+    "5f09edfd23c7": {
+      "first_seen": "2026-09-10T18:49:41.030346",
+      "last_seen": "2026-09-10T18:52:11.999886",
+      "source": "research_fabric",
+      "query": "MCP protocol vs A2A protocol"
+    },
+    "043a77848073": {
+      "first_seen": "2026-09-10T18:49:41.030348",
+      "last_seen": "2026-09-10T18:52:11.999889",
+      "source": "research_fabric",
+      "query": "MCP protocol vs A2A protocol"
+    },
+    "323b9c17c685": {
+      "first_seen": "2026-09-10T18:49:41.030351",
+      "last_seen": "2026-09-10T18:52:11.999891",
+      "source": "research_fabric",
+      "query": "MCP protocol vs A2A protocol"
+    },
+    "e00c2323304e": {
+      "first_seen": "2026-09-10T18:49:41.030353",
+      "last_seen": "2026-09-10T18:52:11.999896",
+      "source": "research_fabric",
+      "query": "MCP protocol vs A2A protocol"
+    },
+    "320064e56c61": {
+      "first_seen": "2026-09-10T18:49:41.030356",
+      "last_seen": "2026-09-10T18:52:11.999894",
+      "source": "research_fabric",
+      "query": "MCP protocol vs A2A protocol"
+    },
+    "c7a3170ba252": {
+      "first_seen": "2026-09-10T18:49:41.030359",
+      "last_seen": "2026-09-10T18:52:11.999899",
+      "source": "research_fabric",
+      "query": "MCP protocol vs A2A protocol"
+    },
+    "3ef4b2b1e6b6": {
+      "first_seen": "2026-09-10T18:49:41.030363",
+      "last_seen": "2026-09-10T18:49:41.030364",
+      "source": "research_fabric",
+      "query": "MCP protocol vs A2A protocol"
+    },
+    "e868a0214f24": {
+      "first_seen": "2026-09-10T18:50:07.777910",
+      "last_seen": "2026-09-10T18:52:11.999903",
+      "source": "research_fabric",
+      "query": "MCP protocol vs A2A protocol"
+    }
+  },
+  "signals": [],
+  "updated_at": "2026-09-10T18:52:11.999908"
+}
