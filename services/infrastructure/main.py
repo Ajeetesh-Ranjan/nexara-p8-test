@@ -119,6 +119,7 @@ def services(handler, query):
         "relay": RELAY_URL,
         "research-fabric": os.environ.get("NEXARA_RESEARCH_URL", "http://research-fabric:8083"),
         "shared-brain": os.environ.get("NEXARA_SHARED_URL", "http://shared-brain:8084"),
+        "world-intelligence": os.environ.get("NEXARA_WI_URL", "http://world-intelligence:8086"),
     }
     results = {}
     for name, url in targets.items():

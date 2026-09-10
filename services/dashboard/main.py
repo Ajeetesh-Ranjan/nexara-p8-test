@@ -20,6 +20,7 @@ RELAY_URL = os.environ.get("NEXARA_RELAY_URL", "http://relay:8082")
 RESEARCH_URL = os.environ.get("NEXARA_RESEARCH_URL", "http://research-fabric:8083")
 SHARED_URL = os.environ.get("NEXARA_SHARED_URL", "http://shared-brain:8084")
 INFRA_URL = os.environ.get("NEXARA_INFRA_URL", "http://infrastructure:8085")
+WI_URL = os.environ.get("NEXARA_WI_URL", "http://world-intelligence:8086")
 
 svc = Service("dashboard")
 
@@ -45,6 +46,9 @@ def collect() -> dict:
         "sync": safe(lambda: _get(f"{SHARED_URL}/sync")),
         "services": safe(lambda: _get(f"{INFRA_URL}/services")),
         "host": safe(lambda: _get(f"{INFRA_URL}/observe")),
+        "world": safe(lambda: _get(f"{WI_URL}/cycle")),
+        "signals": safe(lambda: _get(f"{WI_URL}/signals?limit=6")),
+        "opps": safe(lambda: _get(f"{WI_URL}/opportunities?limit=5")),
     }
 
 
@@ -94,6 +98,25 @@ def _render(d: dict) -> str:
     disk = (host.get("data_disk") or {})
     gpu = (host.get("gpu") or {})
 
+    world = d.get("world", {}) or {}
+    wlast = world.get("last_run", {}) or {}
+    sig_rows = []
+    for s in (d.get("signals", {}) or {}).get("signals", [])[:6]:
+        cls = "ok" if s.get("strength", 0) >= 0.7 else "warn"
+        sig_rows.append((s.get("entity", "?")[:26],
+                         f'<span class="{cls}">{s.get("strength",0):.2f}</span> '
+                         f'<span class="dim">{s.get("kind","")} · {s.get("distinct_sources",0)}src</span>'))
+    if not sig_rows:
+        sig_rows = [("(no signals yet)", "—")]
+
+    opp_rows = []
+    for o in (d.get("opps", {}) or {}).get("opportunities", [])[:5]:
+        opp_rows.append((o.get("title", "?")[:30],
+                         f'<span class="warn">{o.get("confidence",0):.2f}</span> '
+                         f'<span class="dim">{o.get("kind","")}</span>'))
+    if not opp_rows:
+        opp_rows = [("(none yet)", "—")]
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>NEXARA</title>
 <meta http-equiv="refresh" content="15">
@@ -138,6 +161,16 @@ def _render(d: dict) -> str:
     ("Memory", f"{host.get('host_memory_mb','—')} MB"),
     ("GPU", "yes" if gpu.get("present") else "none"),
     ("Data free", f"{disk.get('free_gb','—')} GB ({disk.get('percent_used','—')}% used)"),
+])}
+{card("World Signals", sig_rows)}
+{card("Opportunities <span class=\'dim\'>(hypotheses)</span>", opp_rows)}
+{card("Intelligence Cycle", [
+    ("Last collected", wlast.get("collected", "—")),
+    ("New items", wlast.get("new_items", "—")),
+    ("Entities", wlast.get("distinct_entities", "—")),
+    ("Signals", wlast.get("signals", "—")),
+    ("Opportunities", wlast.get("opportunities", "—")),
+    ("Baseline entities", wlast.get("baseline_entities", "—")),
 ])}
 {card("Replication", [
     ("Mode", sync.get("mode", "—")),

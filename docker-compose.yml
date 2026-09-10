@@ -23,6 +23,7 @@ x-common: &common
     NEXARA_RESEARCH_URL: http://research-fabric:8083
     NEXARA_SHARED_URL: http://shared-brain:8084
     NEXARA_INFRA_URL: http://infrastructure:8085
+    NEXARA_WI_URL: http://world-intelligence:8086
   networks: [nexara]
   logging:
     driver: json-file
@@ -134,6 +135,30 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  world-intelligence:
+    <<: *common
+    container_name: nexara-worldint
+    command: ["python", "-m", "services.world_intelligence.main"]
+    environment:
+      <<: *common-env
+      PORT: 8086
+      NEXARA_WI_INTERVAL: ${NEXARA_WI_INTERVAL:-3600}
+      NEXARA_WI_AUTOSTART: ${NEXARA_WI_AUTOSTART:-1}
+      NEXARA_FETCH_TIMEOUT: ${NEXARA_FETCH_TIMEOUT:-20}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHANNELS: ${TELEGRAM_CHANNELS:-}
+    volumes:
+      - brain-data:/data
+    depends_on:
+      brain-runtime: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8086/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   backup:
     <<: *common
