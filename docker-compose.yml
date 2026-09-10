@@ -1,0 +1,170 @@
+# NEXARA production stack.
+#
+#   docker compose up -d          start everything
+#   docker compose ps             see health
+#   docker compose logs -f relay  follow one service
+#
+# Every service: named volume for state, healthcheck, restart policy.
+# Only the dashboard publishes a host port by default; internal services talk
+# over the private network. Override with NEXARA_BIND to expose more.
+
+x-common: &common
+  image: nexara:9.0.0
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  environment: &common-env
+    NEXARA_DATA: /data
+    NEXARA_NODE_NAME: ${NEXARA_NODE_NAME:-nexara-local}
+    NEXARA_NODE_ROLE: ${NEXARA_NODE_ROLE:-control}
+    NEXARA_BRAIN_URL: http://brain-runtime:8081
+    NEXARA_RELAY_URL: http://relay:8082
+    NEXARA_RESEARCH_URL: http://research-fabric:8083
+    NEXARA_SHARED_URL: http://shared-brain:8084
+    NEXARA_INFRA_URL: http://infrastructure:8085
+  networks: [nexara]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  brain-runtime:
+    <<: *common
+    container_name: nexara-brain
+    command: ["python", "-m", "services.brain_runtime.main"]
+    environment:
+      <<: *common-env
+      PORT: 8081
+    volumes:
+      - brain-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  relay:
+    <<: *common
+    container_name: nexara-relay
+    command: ["python", "-m", "services.relay.main"]
+    environment:
+      <<: *common-env
+      PORT: 8082
+      NEXARA_HEARTBEAT_TIMEOUT: ${NEXARA_HEARTBEAT_TIMEOUT:-90}
+    volumes:
+      - relay-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8082/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  research-fabric:
+    <<: *common
+    container_name: nexara-research
+    command: ["python", "-m", "services.research_fabric.main"]
+    environment:
+      <<: *common-env
+      PORT: 8083
+    volumes:
+      - brain-data:/data          # shares the knowledge volume with brain-runtime
+    depends_on:
+      brain-runtime: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8083/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  shared-brain:
+    <<: *common
+    container_name: nexara-shared
+    command: ["python", "-m", "services.shared_brain.main"]
+    environment:
+      <<: *common-env
+      PORT: 8084
+      NEXARA_PEERS: ${NEXARA_PEERS:-}
+      NEXARA_SYNC_INTERVAL: ${NEXARA_SYNC_INTERVAL:-300}
+    volumes:
+      - shared-data:/data
+    depends_on:
+      brain-runtime: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8084/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  infrastructure:
+    <<: *common
+    container_name: nexara-infra
+    command: ["python", "-m", "services.infrastructure.main"]
+    environment:
+      <<: *common-env
+      PORT: 8085
+    volumes:
+      - infra-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8085/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  dashboard:
+    <<: *common
+    container_name: nexara-dashboard
+    command: ["python", "-m", "services.dashboard.main"]
+    environment:
+      <<: *common-env
+      PORT: 8080
+    ports:
+      - "${NEXARA_BIND:-127.0.0.1}:${NEXARA_DASHBOARD_PORT:-8080}:8080"
+    depends_on:
+      brain-runtime: { condition: service_healthy }
+      relay: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  backup:
+    <<: *common
+    container_name: nexara-backup
+    command: ["python", "/app/scripts/backup_daemon.py"]
+    environment:
+      <<: *common-env
+      NEXARA_BACKUP_INTERVAL: ${NEXARA_BACKUP_INTERVAL:-3600}
+      NEXARA_BACKUP_KEEP: ${NEXARA_BACKUP_KEEP:-24}
+      NEXARA_GIT_REMOTE: ${NEXARA_GIT_REMOTE:-}
+    volumes:
+      - brain-data:/data
+      - relay-data:/data-relay:ro
+      - infra-data:/data-infra:ro
+      - backup-data:/backups
+    depends_on:
+      brain-runtime: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "test", "-f", "/backups/.daemon-alive"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+networks:
+  nexara:
+    driver: bridge
+
+volumes:
+  brain-data:
+  relay-data:
+  shared-data:
+  infra-data:
+  backup-data:
