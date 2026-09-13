@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""
+nexara — single entry point for NEXARA on a laptop or a server.
+
+Two runtimes, same commands:
+
+  local   services run as plain processes from a venv   (laptop testing)
+  docker  services run as containers                    (VPS / shipping)
+
+  nexara up              start (local by default)
+  nexara down            stop
+  nexara status          what is running, brain counts, source health
+  nexara logs [service]  follow logs
+  nexara doctor          diagnose a broken setup
+
+Intelligence commands work against whichever runtime is up:
+
+  nexara today | matters | opportunities | threats | research
+  nexara monitor | accelerating | companies | sources
+  nexara cycle           run a collection/analysis pass now
+  nexara ask "<text>"    route a free-text question to the right view
+  nexara research "<q>"  run a research pass through the Research Fabric
+  nexara dashboard       open the web view
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HOME = os.path.expanduser("~")
+# Resolve through symlinks: ~/.local/bin/nexara -> <repo>/scripts/nexara
+_SELF = os.path.realpath(os.path.abspath(__file__))
+REPO = os.environ.get("NEXARA_REPO_DIR", os.path.dirname(os.path.dirname(_SELF)))
+STATE = os.path.join(HOME, ".nexara")
+VENV = os.path.join(STATE, "venv")
+DATA = os.path.join(STATE, "data")
+LOGS = os.path.join(STATE, "logs")
+PIDS = os.path.join(STATE, "run")
+
+# local runtime uses 818x so it never collides with a docker stack on 808x
+LOCAL_PORTS = {"brain-runtime": 8181, "relay": 8182, "research-fabric": 8183,
+               "shared-brain": 8184, "infrastructure": 8185,
+               "world-intelligence": 8186, "dashboard": 8180}
+DOCKER_PORTS = {"brain-runtime": 8081, "relay": 8082, "research-fabric": 8083,
+                "shared-brain": 8084, "infrastructure": 8085,
+                "world-intelligence": 8086, "dashboard": 8080}
+
+MODULES = {
+    "brain-runtime": "services.brain_runtime.main",
+    "relay": "services.relay.main",
+    "research-fabric": "services.research_fabric.main",
+    "shared-brain": "services.shared_brain.main",
+    "infrastructure": "services.infrastructure.main",
+    "world-intelligence": "services.world_intelligence.main",
+    "dashboard": "services.dashboard.main",
+}
+ORDER = ["brain-runtime", "relay", "research-fabric", "shared-brain",
+         "infrastructure", "world-intelligence", "dashboard"]
+
+C = {"dim": "\033[2m", "b": "\033[1m", "g": "\033[32m", "y": "\033[33m",
+     "r": "\033[31m", "c": "\033[36m", "x": "\033[0m"}
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    C = {k: "" for k in C}
+
+
+def say(msg=""):
+    print(msg, flush=True)
+
+
+def die(msg, hint=""):
+    say(f"{C['r']}error{C['x']}  {msg}")
+    if hint:
+        say(f"{C['dim']}{hint}{C['x']}")
+    sys.exit(1)
+
+
+# ------------------------------------------------------------------ runtime --
+
+def docker_running() -> bool:
+    if not shutil.which("docker"):
+        return False
+    try:
+        out = subprocess.run(["docker", "compose", "ps", "-q"], cwd=REPO,
+                             capture_output=True, text=True, timeout=15)
+        return bool(out.stdout.strip())
+    except Exception:
+        return False
+
+
+def local_running() -> bool:
+    return any(_pid_alive(s) for s in ORDER)
+
+
+def active_ports() -> tuple[dict, str]:
+    """Which runtime answers right now."""
+    forced = os.environ.get("NEXARA_RUNTIME", "").strip().lower()
+    if forced == "local":
+        return LOCAL_PORTS, "local"
+    if forced == "docker":
+        return DOCKER_PORTS, "docker"
+    if local_running():
+        return LOCAL_PORTS, "local"
+    if docker_running():
+        return DOCKER_PORTS, "docker"
+    return LOCAL_PORTS, "none"
+
+
+def url(service: str) -> str:
+    ports, _ = active_ports()
+    return f"http://127.0.0.1:{ports[service]}"
+
+
+# --------------------------------------------------------------------- http --
+
+def get(service: str, path: str, timeout: int = 300):
+    try:
+        with urllib.request.urlopen(f"{url(service)}{path}", timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.URLError as e:
+        _unreachable(service, e)
+    except Exception as e:
+        _unreachable(service, e)
+
+
+def post(service: str, path: str, payload: dict | None = None, timeout: int = 600):
+    req = urllib.request.Request(
+        f"{url(service)}{path}", data=json.dumps(payload or {}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        _unreachable(service, e)
+
+
+def _unreachable(service, e):
+    _, mode = active_ports()
+    say(f"{C['r']}cannot reach {service}{C['x']} at {url(service)}  {C['dim']}({e}){C['x']}")
+    if mode == "none":
+        say(f"\n{C['y']}nothing is running.{C['x']}  start it with:")
+        say(f"  {C['g']}nexara up{C['x']}")
+    else:
+        say(f"\n{C['dim']}runtime: {mode}. check with:{C['x']}  nexara status")
+    sys.exit(1)
+
+
+# ------------------------------------------------------------ local runtime --
+
+def _pidfile(service):
+    return os.path.join(PIDS, f"{service}.pid")
+
+
+def _pid_alive(service) -> int | None:
+    try:
+        pid = int(open(_pidfile(service)).read().strip())
+        os.kill(pid, 0)
+        return pid
+    except Exception:
+        return None
+
+
+def ensure_venv(quiet=False) -> str:
+    """Create ~/.nexara/venv with the runtime deps. Idempotent."""
+    py = os.path.join(VENV, "bin", "python")
+    need = not os.path.exists(py)
+    if not need:
+        r = subprocess.run([py, "-c", "import arxiv"], capture_output=True)
+        need = r.returncode != 0
+    if need:
+        base = shutil.which("python3") or sys.executable
+        # avoid building on top of another tool's venv
+        for cand in ("/usr/bin/python3", "/usr/local/bin/python3"):
+            if os.path.exists(cand):
+                base = cand
+                break
+        if not quiet:
+            say(f"{C['dim']}creating runtime venv at {VENV} ({base}){C['x']}")
+        os.makedirs(STATE, exist_ok=True)
+        subprocess.run([base, "-m", "venv", VENV], check=True)
+        req = os.path.join(REPO, "requirements.txt")
+        r = subprocess.run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check",
+                            "-r", req], capture_output=True, text=True)
+        if r.returncode != 0:
+            die("dependency install failed", r.stderr[-500:])
+        if not quiet:
+            say(f"{C['g']}venv ready{C['x']}")
+    return py
+
+
+def local_up(services=None, wait=True):
+    py = ensure_venv()
+    for d in (DATA, LOGS, PIDS):
+        os.makedirs(d, exist_ok=True)
+
+    targets = services or ORDER
+    env = {
+        **os.environ,
+        "NEXARA_DATA": DATA,
+        "PYTHONPATH": REPO,
+        "PYTHONUNBUFFERED": "1",
+        "NEXARA_NODE_NAME": os.environ.get("NEXARA_NODE_NAME", "laptop"),
+        "NEXARA_NODE_ROLE": os.environ.get("NEXARA_NODE_ROLE", "control"),
+    }
+    for name, port in LOCAL_PORTS.items():
+        key = {"brain-runtime": "NEXARA_BRAIN_URL", "relay": "NEXARA_RELAY_URL",
+               "research-fabric": "NEXARA_RESEARCH_URL", "shared-brain": "NEXARA_SHARED_URL",
+               "infrastructure": "NEXARA_INFRA_URL", "world-intelligence": "NEXARA_WI_URL"}.get(name)
+        if key:
+            env[key] = f"http://127.0.0.1:{port}"
+
+    started = []
+    for svc in targets:
+        if _pid_alive(svc):
+            say(f"  {C['dim']}{svc:20} already running{C['x']}")
+            continue
+        logf = open(os.path.join(LOGS, f"{svc}.log"), "a")
+        p = subprocess.Popen(
+            [py, "-m", MODULES[svc]],
+            cwd=REPO, env={**env, "PORT": str(LOCAL_PORTS[svc])},
+            stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+        open(_pidfile(svc), "w").write(str(p.pid))
+        started.append(svc)
+        say(f"  {C['g']}started{C['x']} {svc:20} {C['dim']}:{LOCAL_PORTS[svc]}  pid {p.pid}{C['x']}")
+
+    if wait and started:
+        say(f"\n{C['dim']}waiting for health...{C['x']}")
+        deadline = time.time() + 60
+        pending = set(started)
+        while pending and time.time() < deadline:
+            for svc in list(pending):
+                try:
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{LOCAL_PORTS[svc]}/health", timeout=3) as r:
+                        if json.loads(r.read().decode()).get("status") == "healthy":
+                            pending.discard(svc)
+                except Exception:
+                    pass
+            if pending:
+                time.sleep(2)
+        for svc in pending:
+            say(f"  {C['y']}{svc} not healthy yet{C['x']} "
+                f"{C['dim']}— nexara logs {svc}{C['x']}")
+    return started
+
+
+def local_down():
+    stopped = 0
+    for svc in reversed(ORDER):
+        pid = _pid_alive(svc)
+        if not pid:
+            continue
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+        stopped += 1
+        say(f"  {C['dim']}stopped {svc} (pid {pid}){C['x']}")
+    time.sleep(1)
+    for svc in ORDER:
+        pid = _pid_alive(svc)
+        if pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+        try:
+            os.unlink(_pidfile(svc))
+        except OSError:
+            pass
+    return stopped
+
+
+# ----------------------------------------------------------------- commands --
+
+def cmd_up(a):
+    if a.docker:
+        if not shutil.which("docker"):
+            die("docker not installed", "use 'nexara up' for the local runtime instead")
+        say(f"{C['b']}starting docker stack{C['x']}")
+        subprocess.run(["docker", "compose", "up", "-d"], cwd=REPO, check=False)
+        say(f"\n{C['dim']}health:{C['x']}  docker compose ps")
+        return
+    say(f"{C['b']}starting NEXARA (local runtime){C['x']}")
+    say(f"{C['dim']}data: {DATA}{C['x']}\n")
+    local_up()
+    say(f"\n{C['g']}up{C['x']}  dashboard: {C['c']}http://127.0.0.1:{LOCAL_PORTS['dashboard']}{C['x']}")
+    say(f"{C['dim']}first intelligence cycle runs automatically in ~20s{C['x']}")
+    say(f"{C['dim']}try:  nexara status   ·   nexara matters   ·   nexara ask \"what matters\"{C['x']}")
+
+
+def cmd_down(a):
+    if a.docker or (not local_running() and docker_running()):
+        say(f"{C['b']}stopping docker stack{C['x']}")
+        subprocess.run(["docker", "compose", "down"], cwd=REPO, check=False)
+        return
+    n = local_down()
+    say(f"{C['g']}stopped{C['x']} {n} service(s)" if n else f"{C['dim']}nothing was running{C['x']}")
+
+
+def cmd_status(a):
+    ports, mode = active_ports()
+    if mode == "none":
+        say(f"{C['y']}NEXARA is not running{C['x']}")
+        say(f"\nstart it:  {C['g']}nexara up{C['x']}        {C['dim']}(local, for testing){C['x']}")
+        say(f"           {C['g']}nexara up --docker{C['x']} {C['dim']}(containers, for the VPS){C['x']}")
+        return
+    say(f"\n{C['b']}NEXARA{C['x']}  {C['dim']}runtime: {mode}{C['x']}\n")
+
+    for svc in ORDER:
+        port = ports[svc]
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=4) as r:
+                h = json.loads(r.read().decode())
+            up = h.get("status") == "healthy"
+            mark = f"{C['g']}●{C['x']}" if up else f"{C['r']}●{C['x']}"
+            extra = f"{C['dim']}up {int(h.get('uptime_seconds',0))}s{C['x']}"
+        except Exception:
+            mark, extra = f"{C['r']}●{C['x']}", f"{C['r']}unreachable{C['x']}"
+        say(f"  {mark} {svc:20} {C['dim']}:{port}{C['x']}  {extra}")
+
+    try:
+        b = get("brain-runtime", "/stats", timeout=8)
+        say(f"\n  {C['dim']}brain 2{C['x']}  {b['brain2_entries']} entries "
+            f"{C['dim']}({b['brain2_bytes']:,} B){C['x']}")
+        say(f"  {C['dim']}brain 3{C['x']}  {b['brain3_entities']} entities, "
+            f"{b['brain3_signals']} signals")
+    except SystemExit:
+        pass
+    try:
+        w = get("world-intelligence", "/cycle", timeout=8).get("last_run", {})
+        if w:
+            say(f"  {C['dim']}world  {C['x']}  {w.get('window_items','?')} items in window, "
+                f"{w.get('signals','?')} signals, {w.get('opportunities','?')} opportunities")
+    except SystemExit:
+        pass
+    say(f"\n  {C['dim']}dashboard{C['x']} http://127.0.0.1:{ports['dashboard']}")
+
+
+def cmd_logs(a):
+    _, mode = active_ports()
+    if mode == "docker":
+        cmd = ["docker", "compose", "logs", "-f"] + ([a.service] if a.service else [])
+        subprocess.run(cmd, cwd=REPO)
+        return
+    if a.service:
+        files = [os.path.join(LOGS, f"{a.service}.log")]
+        if not os.path.exists(files[0]):
+            die(f"no log for '{a.service}'", f"services: {', '.join(ORDER)}")
+    else:
+        files = [os.path.join(LOGS, f"{s}.log") for s in ORDER
+                 if os.path.exists(os.path.join(LOGS, f"{s}.log"))]
+    if not files:
+        die("no logs yet", "start something first:  nexara up")
+    subprocess.run(["tail", "-n", "40", "-f"] + files)
+
+
+def cmd_doctor(a):
+    say(f"\n{C['b']}NEXARA doctor{C['x']}\n")
+    ok = True
+
+    py = shutil.which("python3")
+    say(f"  python3            {C['g']}{py}{C['x']}" if py else f"  python3            {C['r']}missing{C['x']}")
+    ok &= bool(py)
+
+    venv_py = os.path.join(VENV, "bin", "python")
+    if os.path.exists(venv_py):
+        r = subprocess.run([venv_py, "-c", "import arxiv;print(arxiv.__version__)"],
+                           capture_output=True, text=True)
+        say(f"  runtime venv       {C['g']}ok{C['x']} {C['dim']}(arxiv {r.stdout.strip()}){C['x']}"
+            if r.returncode == 0 else f"  runtime venv       {C['y']}deps missing{C['x']}")
+    else:
+        say(f"  runtime venv       {C['y']}not created yet{C['x']} {C['dim']}(nexara up builds it){C['x']}")
+
+    say(f"  docker             " + (f"{C['g']}{shutil.which('docker')}{C['x']}"
+                                    if shutil.which("docker") else f"{C['dim']}not installed (optional){C['x']}"))
+    say(f"  data dir           {DATA} "
+        + (f"{C['g']}exists{C['x']}" if os.path.isdir(DATA) else f"{C['dim']}will be created{C['x']}"))
+
+    say(f"\n  {C['dim']}ports{C['x']}")
+    for svc in ORDER:
+        for label, ports in (("local", LOCAL_PORTS), ("docker", DOCKER_PORTS)):
+            p = ports[svc]
+            busy = subprocess.run(["bash", "-c", f"(echo >/dev/tcp/127.0.0.1/{p}) 2>/dev/null"],
+                                  capture_output=True).returncode == 0
+            if busy and label == "local":
+                say(f"    {svc:20} local :{p} {C['y']}in use{C['x']}")
+
+    say(f"\n  {C['dim']}network egress{C['x']}")
+    for name, u in (("hacker news", "https://hacker-news.firebaseio.com/v0/topstories.json"),
+                    ("arxiv", "https://export.arxiv.org/api/query?search_query=cat:cs.AI&max_results=1"),
+                    ("github", "https://api.github.com/rate_limit")):
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                u, headers={"User-Agent": "nexara-doctor"}), timeout=10).read(64)
+            say(f"    {name:14} {C['g']}reachable{C['x']}")
+        except Exception as e:
+            say(f"    {name:14} {C['r']}unreachable{C['x']} {C['dim']}{str(e)[:50]}{C['x']}")
+            ok = False
+
+    _, mode = active_ports()
+    say(f"\n  runtime detected   {C['c']}{mode}{C['x']}")
+    say(f"\n{C['g']}looks usable{C['x']}" if ok else f"\n{C['y']}issues above{C['x']}")
+
+
+def cmd_dashboard(a):
+    ports, mode = active_ports()
+    u = f"http://127.0.0.1:{ports['dashboard']}"
+    if mode == "none":
+        die("nothing running", "nexara up")
+    say(f"opening {C['c']}{u}{C['x']}")
+    for opener in ("xdg-open", "open"):
+        if shutil.which(opener):
+            subprocess.Popen([opener, u], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+    say(f"{C['dim']}no opener found — paste the URL into a browser{C['x']}")
+
+
+# ------------------------------------------------- intelligence passthroughs --
+
+def bar(v, width=12):
+    f = int(round(v * width))
+    col = C["g"] if v >= 0.7 else (C["y"] if v >= 0.4 else C["dim"])
+    return f"{col}{'█'*f}{C['dim']}{'·'*(width-f)}{C['x']}"
+
+
+def hdr(t, sub=""):
+    say(f"\n{C['b']}{t}{C['x']}")
+    if sub:
+        say(f"{C['dim']}{sub}{C['x']}")
+    say()
+
+
+def cmd_cycle(a):
+    say("running a collection + analysis pass (30-60s)...")
+    s = post("world-intelligence", "/cycle")
+    if s.get("skipped"):
+        say(f"{C['y']}{s['skipped']}{C['x']}")
+        return
+    hdr("CYCLE COMPLETE", f"{s['duration_seconds']}s")
+    say(f"  collected      {s['collected']} ({s['new_items']} new after dedupe)")
+    say(f"  window         {s.get('window_items','?')} items analysed")
+    say(f"  entities       {s['distinct_entities']}")
+    say(f"  signals        {s['signals']} {C['dim']}{s['signals_by_kind']}{C['x']}")
+    say(f"  opportunities  {s['opportunities']}")
+    p = s.get("pushed", {})
+    say(f"  brain 2 +{p.get('brain2',0)}   brain 3 +{p.get('brain3',0)}")
+
+
+def cmd_today(a):
+    d = get("world-intelligence", "/ask/today")
+    w = d["window"]
+    hdr("WHAT HAPPENED TODAY",
+        f"{w['items_collected']} items, {w['new_items']} new, {d['entities_observed']} entities")
+    for t in d["top_activity"]:
+        say(f"  {C['c']}{t['entity']}{C['x']} {C['dim']}{t['mentions']} mentions / {t['sources']} sources{C['x']}")
+        for e in t["evidence"][:1]:
+            say(f"    {C['dim']}[{e['source']}]{C['x']} {e['title'][:76]}")
+
+
+def cmd_matters(a):
+    d = get("world-intelligence", "/ask/matters")
+    hdr("WHAT MATTERS TODAY", d["basis"])
+    if not d["signals"]:
+        say(f"  {C['dim']}no multi-source signals yet — run 'nexara cycle'{C['x']}")
+    for s in d["signals"]:
+        say(f"  {bar(s['strength'])} {s['strength']:.2f}  {C['b']}{s['entity']}{C['x']} {C['dim']}({s['kind']}){C['x']}")
+        say(f"    {C['dim']}{s['why']}{C['x']}")
+
+
+def cmd_opportunities(a):
+    d = get("world-intelligence", "/ask/opportunities")
+    hdr("WHAT OPPORTUNITIES EXIST", d["caveat"])
+    for o in d["opportunities"]:
+        say(f"  {bar(o['confidence'])} {o['confidence']:.2f}  {C['b']}{o['title']}{C['x']} {C['dim']}[{o['kind']}]{C['x']}")
+        say(f"    {o['thesis'][:150]}")
+        say(f"    {C['g']}next:{C['x']} {o['next_step']}")
+        for r in o["risks"][:2]:
+            say(f"    {C['y']}risk:{C['x']} {C['dim']}{r}{C['x']}")
+        say()
+
+
+def cmd_threats(a):
+    d = get("world-intelligence", "/ask/threats")
+    hdr("WHAT THREATS EXIST", d["basis"])
+    if not d["threats"]:
+        say(f"  {C['dim']}no risk-language signals in the current window{C['x']}")
+    for t in d["threats"]:
+        say(f"  {bar(t['strength'])} {t['strength']:.2f}  {C['r']}{t['entity']}{C['x']}")
+        say(f"    {C['dim']}{t['why']}{C['x']}")
+
+
+def cmd_research_list(a):
+    d = get("world-intelligence", "/ask/research")
+    hdr("WHAT SHOULD WE RESEARCH")
+    for c in d["candidates"]:
+        say(f"  {C['c']}{c['topic']}{C['x']} {C['dim']}({c['confidence']:.2f}){C['x']}")
+        say(f"    {C['g']}${C['x']} nexara research \"{c['topic']}\"")
+
+
+def cmd_monitor(a):
+    d = get("world-intelligence", "/ask/monitor")
+    hdr("WHAT SHOULD WE MONITOR", d["basis"])
+    for w in d["watchlist"]:
+        say(f"  {bar(w['strength'])} {w['strength']:.2f}  {w['entity']} {C['dim']}({w['kind']}, {w['sources']} src){C['x']}")
+
+
+def cmd_accelerating(a):
+    d = get("world-intelligence", "/ask/accelerating")
+    hdr("WHICH TECHNOLOGIES ARE ACCELERATING", d["basis"])
+    if not d["entities"]:
+        say(f"  {C['y']}not enough history yet{C['x']}")
+        say(f"  {C['dim']}{d['note']}{C['x']}")
+        return
+    for e in d["entities"]:
+        say(f"  {C['c']}{e['entity']:30}{C['x']} {e['mean_mentions']:>6.2f}/window "
+            f"{C['dim']}over {e['windows']} windows{C['x']}")
+
+
+def cmd_companies(a):
+    d = get("world-intelligence", "/ask/companies")
+    hdr("WHICH COMPANIES SHOULD WE WATCH")
+    for c in d["companies"]:
+        say(f"  {bar(c['strength'])} {c['strength']:.2f}  {C['b']}{c['company']}{C['x']} "
+            f"{C['dim']}{c['mentions']} mentions{C['x']}")
+
+
+def cmd_sources(a):
+    d = get("world-intelligence", "/cycle").get("last_run", {})
+    hdr("SOURCE HEALTH")
+    if not d.get("sources"):
+        say(f"  {C['dim']}no cycle has run yet — nexara cycle{C['x']}")
+        return
+    for r in d["sources"]:
+        state = (f"{C['g']}ok{C['x']}" if r["ok"] else
+                 (f"{C['y']}unconfigured{C['x']}" if not r["configured"] else f"{C['r']}FAIL{C['x']}"))
+        say(f"  {r['source']:18} {r['category']:12} {r['items']:4}  {state}")
+        if r["error"]:
+            say(f"    {C['dim']}{r['error'][:90]}{C['x']}")
+
+
+def cmd_research(a):
+    q = " ".join(a.query)
+    say(f"researching {C['c']}{q}{C['x']} ...")
+    job = post("research-fabric", "/research", {"query": q, "domain": a.domain})
+    jid = job["job_id"]
+    for _ in range(60):
+        time.sleep(3)
+        st = get("research-fabric", f"/research?job={jid}", timeout=20)
+        if st.get("state") != "running":
+            break
+    if st.get("state") == "done":
+        hdr("RESEARCH COMPLETE")
+        say(f"  sources    {st['sources']}")
+        say(f"  findings   {st['findings']}")
+        say(f"  confidence {st['confidence']}")
+        say(f"  brain 2    {'written' if st['pushed'].get('brain2') else 'not written'}")
+        for p in st.get("wiki_pages", []):
+            say(f"  wiki       {p}")
+    else:
+        say(f"{C['r']}failed{C['x']}: {st.get('error','unknown')}")
+
+
+ASK_ROUTES = [
+    (("happen", "today", "news", "latest"), cmd_today),
+    (("matter", "important", "significant"), cmd_matters),
+    (("opportunit", "should we build", "worth building"), cmd_opportunities),
+    (("threat", "risk", "danger", "vulnerab"), cmd_threats),
+    (("research", "study", "investigate", "look into"), cmd_research_list),
+    (("monitor", "watch list", "watchlist", "keep an eye"), cmd_monitor),
+    (("acceler", "growing", "trending", "rising"), cmd_accelerating),
+    (("compan", "vendor", "startup"), cmd_companies),
+    (("source", "feed", "collector"), cmd_sources),
+]
+
+
+def cmd_ask(a):
+    q = " ".join(a.question).lower()
+    # Score every route and take the strongest match. First-wins routing sent
+    # "what matters today" to the 'today' view because 'today' matched first.
+    best, best_score = None, 0
+    for keys, fn in ASK_ROUTES:
+        score = sum(len(k) for k in keys if k in q)
+        if score > best_score:
+            best, best_score = fn, score
+    if best:
+        return best(a)
+    say(f"{C['y']}not sure which view answers that.{C['x']}\n")
+    say("NEXARA answers from collected evidence, not free-form conversation.")
+    say("Try one of:\n")
+    for keys, fn in ASK_ROUTES:
+        say(f"  {C['g']}nexara {fn.__name__.replace('cmd_','').replace('research_list','research')}{C['x']}"
+            f"  {C['dim']}— {keys[0]}...{C['x']}")
+    say(f"\nOr run a research pass:  {C['g']}nexara research \"{' '.join(a.question)}\"{C['x']}")
+
+
+# --------------------------------------------------------------------- main --
+
+def main():
+    p = argparse.ArgumentParser(prog="nexara", description="NEXARA intelligence platform",
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog=__doc__.split("Two runtimes")[1] if __doc__ else "")
+    sub = p.add_subparsers(dest="cmd")
+
+    up = sub.add_parser("up", help="start NEXARA")
+    up.add_argument("--docker", action="store_true", help="use containers instead of local processes")
+    dn = sub.add_parser("down", help="stop NEXARA")
+    dn.add_argument("--docker", action="store_true")
+    sub.add_parser("status", help="what is running")
+    lg = sub.add_parser("logs", help="follow logs")
+    lg.add_argument("service", nargs="?")
+    sub.add_parser("doctor", help="diagnose setup problems")
+    sub.add_parser("dashboard", help="open the web view")
+
+    sub.add_parser("cycle", help="run a collection + analysis pass")
+    sub.add_parser("today", help="what happened today")
+    sub.add_parser("matters", help="what matters today")
+    sub.add_parser("opportunities", help="what opportunities exist")
+    sub.add_parser("threats", help="what threats exist")
+    sub.add_parser("monitor", help="what to monitor")
+    sub.add_parser("accelerating", help="what is accelerating")
+    sub.add_parser("companies", help="companies to watch")
+    sub.add_parser("sources", help="source health")
+
+    rs = sub.add_parser("research", help='run a research pass: nexara research "MCP vs A2A"')
+    rs.add_argument("query", nargs="+")
+    rs.add_argument("--domain", default="technology",
+                    choices=["technology", "ai", "open-source", "communities",
+                             "industry-trends", "business", "news"])
+
+    ak = sub.add_parser("ask", help='free-text question: nexara ask "what matters today"')
+    ak.add_argument("question", nargs="+")
+
+    a = p.parse_args()
+    if not a.cmd:
+        p.print_help()
+        return
+
+    table = {
+        "up": cmd_up, "down": cmd_down, "status": cmd_status, "logs": cmd_logs,
+        "doctor": cmd_doctor, "dashboard": cmd_dashboard, "cycle": cmd_cycle,
+        "today": cmd_today, "matters": cmd_matters, "opportunities": cmd_opportunities,
+        "threats": cmd_threats, "monitor": cmd_monitor, "accelerating": cmd_accelerating,
+        "companies": cmd_companies, "sources": cmd_sources, "research": cmd_research,
+        "ask": cmd_ask,
+    }
+    try:
+        table[a.cmd](a)
+    except KeyboardInterrupt:
+        say()
+
+
+if __name__ == "__main__":
+    main()

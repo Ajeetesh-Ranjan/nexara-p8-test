@@ -11,6 +11,8 @@ each run records per-entity mention counts, so the next run can compare against
 history instead of asserting novelty.
 """
 import json
+import fcntl
+import re
 import os
 import sys
 import time
@@ -21,8 +23,10 @@ sys.path.insert(0, "/app")
 
 from services.common.store import StateStore
 from services.world_intelligence import collectors as C
+from services.world_intelligence.telegram_intelligence import IntelligenceRegistry as TelegramRegistry
 from services.world_intelligence.entities import extract
-from services.world_intelligence.engine import SignalEngine, OpportunityEngine
+from services.world_intelligence.engine import SignalEngine, OpportunityEngine, _canonical_url, _stable_id
+from services.world_intelligence.history import TrendHistory
 
 DATA = os.environ.get("NEXARA_DATA", "/data")
 WI_DIR = os.path.join(DATA, "world-intelligence")
@@ -57,139 +61,105 @@ class Workspace:
     def __init__(self, root: str = WI_DIR):
         self.store = StateStore(root)
 
-    # ------------------------------------------------------------- run ----
+    def _snapshot(self):
+        return self.store.read("snapshot.json", {})
+
     def run(self, only: list[str] | None = None, push: bool = True) -> dict:
+        # A separate cycle lock prevents CLI and timer runs from losing updates.
+        with open(self.store.path("cycle.lock"), "w") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            return self._run(only, push)
+
+    def _run(self, only, push):
         started = time.time()
-
-        # 1. collect
-        items, reports = C.collect_all(only)
-        collected = len(items)
-
-        # 2. deduplicate against prior windows (persistent, bounded)
-        seen: dict = self.store.read(SEEN, {})
-        fresh = []
-        for it in items:
-            k = it.key()
-            if k in seen:
+        registry = TelegramRegistry(self.store.root)
+        items, reports = C.collect_all(only, tg_registry=registry)
+        prior = self._snapshot()
+        seen = {k: ts for k, ts in prior.get("seen", {}).items() if ts >= started - 30 * 86400}
+        window = {r["key"]: r for r in prior.get("items", []) if r.get("observed_at", 0) >= started - WINDOW_SECONDS}
+        fresh, discarded = [], 0
+        for item in items:
+            key = _canonical_url(item.url)
+            if not key or key in seen:
                 continue
-            seen[k] = it.fetched_at
-            fresh.append(it)
-        # keep the dedupe index bounded to ~30 days
-        cutoff = time.time() - 30 * 86400
-        seen = {k: v for k, v in seen.items() if v > cutoff}
-        self.store.write(SEEN, seen)
-
-        # 3. maintain a rolling window of recent items, then extract over the WINDOW.
-        #    Fresh items are added; the window is trimmed by age and size.
-        window: list[dict] = self.store.read(RECENT, [])
-        if not isinstance(window, list):
-            window = []
-        for it in fresh:
-            window.append({"title": it.title, "url": it.url, "source": it.source,
-                           "category": it.category, "text": it.text[:600],
-                           "published_at": it.published_at, "fetched_at": it.fetched_at,
-                           "key": it.key()})
-        wcut = time.time() - WINDOW_SECONDS
-        seen_keys: set[str] = set()
-        deduped = []
-        for row in sorted(window, key=lambda r: r.get("fetched_at", 0), reverse=True):
-            k = row.get("key") or row.get("url")
-            if k in seen_keys:
+            seen[key] = started
+            row = self._prepare(item, registry, started)
+            if row is None:
+                discarded += 1
                 continue
-            if row.get("fetched_at", 0) < wcut:
-                continue
-            seen_keys.add(k)
-            deduped.append(row)
-        window = deduped[:MAX_WINDOW_ITEMS]
-        self.store.write(RECENT, window)
-
-        observations = []
-        for row in window:
-            for e in extract(f"{row['title']}. {row.get('text','')}", row.get("url", "")):
-                observations.append({
-                    "entity": e.name, "type": e.type, "method": e.method,
-                    "weight": e.weight, "item": row,
-                })
-
-        # 4. signals, measured against the stored baseline
-        baseline: dict = self.store.read(BASELINE, {})
-        sig_engine = SignalEngine(baseline)
+            row["key"] = key
+            window[key] = row
+            fresh.append(row)
+        window = sorted(window.values(), key=lambda r: r["observed_at"], reverse=True)[:MAX_WINDOW_ITEMS]
+        observations = self._observations(window)
+        # Record this window's observations into the non-overlapping trend history
+        # so trend computation is replay-safe (deduplicates seen URLs per entity).
+        history = TrendHistory(self.store)
+        if observations:
+            history.observe(observations, reports, now=started)
+        trends = history.trends(now=started) if observations else []
+        sig_engine = SignalEngine({})  # trend measurement is separate, never overlapping baseline means
         signals = sig_engine.detect(observations)
         signals += sig_engine.detect_convergence(signals)
-
-        # 5. opportunities (hypotheses, corroboration required)
-        opportunities = OpportunityEngine().generate(signals)
-
-        # 6. update baseline for the next window
-        counts: dict[str, int] = {}
-        for o in observations:
-            counts[o["entity"]] = counts.get(o["entity"], 0) + 1
-        for entity, n in counts.items():
-            b = baseline.get(entity, {"mean_mentions": 0.0, "windows": 0, "total": 0})
-            b["total"] = b.get("total", 0) + n
-            b["windows"] = b.get("windows", 0) + 1
-            b["mean_mentions"] = round(b["total"] / b["windows"], 3)
-            b["last_seen"] = time.time()
-            baseline[entity] = b
-        self.store.write(BASELINE, baseline)
-
-        # 7. persist signals + opportunities.
-        #    A window with zero new items must never erase prior intelligence:
-        #    merge on id and age out by TTL instead of clobbering.
+        signals = list({s.to_dict()["id"]: s for s in signals}.values())
+        evaluations = OpportunityEngine().evaluate(signals)
+        evaluations.sort(key=lambda e: (-e["scores"]["overall"], e["signal_id"]))
+        opportunities = [e["opportunity"] for e in evaluations if e.get("opportunity")]
         sig_dicts = [s.to_dict() for s in signals]
-        opp_dicts = [o.to_dict() for o in opportunities]
-        sig_dicts = self._merge_retained(SIGNALS, sig_dicts, "last_seen")
-        opp_dicts = self._merge_retained(OPPORTUNITIES, opp_dicts, "created_at")
-        self.store.write(SIGNALS, sig_dicts)
-        self.store.write(OPPORTUNITIES, opp_dicts)
-
-        # 8. push into Brain 2 / Brain 3
-        pushed = {"brain2": 0, "brain3": 0, "errors": []}
-        if push:
-            pushed = self._push(sig_dicts, opp_dicts, observations)
-
         summary = {
-            "started_at": started,
-            "duration_seconds": round(time.time() - started, 1),
-            "sources": reports,
-            "collected": collected,
-            "new_items": len(fresh),
-            "window_items": len(window),
-            "observations": len(observations),
-            "distinct_entities": len(counts),
-            "signals": len(sig_dicts),
-            "signals_by_kind": self._by(sig_dicts, "kind"),
-            "opportunities": len(opp_dicts),
-            "opportunities_by_kind": self._by(opp_dicts, "kind"),
-            "pushed": pushed,
-            "baseline_entities": len(baseline),
+            "schema_version": 11, "started_at": started,
+            "duration_seconds": round(time.time() - started, 2), "sources": reports,
+            "collected": len(items), "new_items": len(fresh), "noise_discarded": discarded,
+            "window_items": len(window), "observations": len(observations),
+            "distinct_entities": len({o["entity"] for o in observations}),
+            "signals": len(signals), "signals_by_kind": self._by(sig_dicts, "kind"),
+            "evaluations": len(evaluations), "decisions": self._by(evaluations, "decision"),
+            "opportunities": len(opportunities), "opportunities_by_kind": self._by(opportunities, "kind"),
+            "trends": len(trends),
+            "pushed": {"brain2": 0, "brain3": 0, "errors": []},
         }
-        self.store.write(LAST_RUN, summary)
+        snapshot = {"version": 11, "seen": dict(sorted(seen.items(), key=lambda x: x[1], reverse=True)[:50000]),
+                    "items": window, "signals": sig_dicts, "opportunities": opportunities,
+                    "evaluations": evaluations, "trends": [t.to_dict() for t in trends],
+                    "last_run": summary}
+        self.store.write("snapshot.json", snapshot)
+        if push:
+            summary["pushed"] = self._push(sig_dicts, opportunities, observations, trends)
+            self.store.write("snapshot.json", snapshot)
         return summary
 
-    def _merge_retained(self, name: str, fresh: list[dict], ts_field: str) -> list[dict]:
-        """
-        Merge freshly computed rows with previously stored ones.
+    @staticmethod
+    def _prepare(item, registry, observed_at):
+        text = " ".join(re.sub(r"<[^>]+>", " ", item.text).split())
+        if len(text) < 30 or C.Telegram()._is_noise(text):
+            return None
+        topics = [t["id"] for t in registry.topics() if any(
+            re.search(r"(?<!\w)" + re.escape(k) + r"(?!\w)", text, re.I) for k in t.get("keywords", []))]
+        entities = extract(f"{item.title}. {text}", item.url, max_heuristic=0)
+        if not entities and not topics:
+            return None
+        raw = item.raw
+        return {"title": item.title[:160], "url": item.url, "source": item.source,
+                "category": item.category, "text": text[:300], "published_at": item.published_at,
+                "fetched_at": item.fetched_at, "observed_at": observed_at,
+                "is_live_data": raw.get("is_live_data", True) is True,
+                "topics": sorted(set(topics + raw.get("topics", []))),
+                "channel": raw.get("channel", ""), "channel_id": raw.get("channel_id", ""),
+                "publisher": raw.get("publisher", ""),
+                "entity_refs": [{"name": e.name, "type": e.type, "method": e.method} for e in entities]}
 
-        Fresh rows win on id collision (they carry the newest evidence). Prior
-        rows survive until RETENTION_SECONDS old, so a dedupe-empty window keeps
-        showing the last real intelligence rather than going blank.
-        """
-        prior = self.store.read(name, [])
-        if not isinstance(prior, list):
-            prior = []
-        cutoff = time.time() - RETENTION_SECONDS
-        merged: dict[str, dict] = {}
-        for row in prior:
-            ts = row.get(ts_field) or row.get("created_at") or 0
-            if isinstance(ts, (int, float)) and ts >= cutoff:
-                merged[row.get("id", repr(row))] = {**row, "retained": True}
-        for row in fresh:
-            merged[row.get("id", repr(row))] = row
-        out = list(merged.values())
-        out.sort(key=lambda r: (r.get("strength", r.get("confidence", 0)),
-                                r.get("distinct_sources", 0)), reverse=True)
-        return out
+    @staticmethod
+    def _observations(rows):
+        observations = []
+        for row in rows:
+            refs = list(row.get("entity_refs", []))
+            if row.get("channel"):
+                refs.append({"name": "channel:" + row["channel"], "type": "channel", "method": "registry"})
+            if not refs and row.get("topics"):
+                refs.append({"name": "topic:" + row["topics"][0], "type": "topic", "method": "registry"})
+            observations.extend({"entity": r["name"], "type": r["type"], "method": r["method"],
+                                 "weight": 1.0, "item": row} for r in refs)
+        return observations
 
     @staticmethod
     def _by(rows: list[dict], key: str) -> dict:
@@ -199,7 +169,7 @@ class Workspace:
         return dict(sorted(out.items(), key=lambda kv: -kv[1]))
 
     def _push(self, signals: list[dict], opportunities: list[dict],
-              observations: list[dict]) -> dict:
+              observations: list[dict], trends: list) -> dict:
         result = {"brain2": 0, "brain3": 0, "errors": []}
 
         # Brain 2: opportunities are knowledge artifacts with evidence
@@ -223,25 +193,96 @@ class Workspace:
                 result["errors"].append(f"brain2 {o['id']}: {e}")
                 break
 
-        # Brain 3: entities and their signal state
+        # Brain 3: entities with roles, relationships, and trends
         ents = {}
+        roles = {}  # entity -> set of roles
         for s in signals:
             for name in (s["entity"].split(" + ") if s["kind"] == "convergence" else [s["entity"]]):
+                etype = s["entity_type"]
                 ents[name] = {
                     "source": "world_intelligence",
-                    "entity_type": s["entity_type"],
+                    "entity_type": etype,
                     "signal_kind": s["kind"],
                     "strength": s["strength"],
                     "distinct_sources": s["distinct_sources"],
                 }
-        if ents:
-            try:
-                r = _post(f"{BRAIN_URL}/brain3", {
-                    "entities": ents,
-                    "signals": [{"id": s["id"], "entity": s["entity"], "kind": s["kind"],
-                                 "strength": s["strength"], "ts": s["last_seen"]}
-                                for s in signals[:50]],
+                # Map entity_type to role taxonomy
+                role = {
+                    "company": "company",
+                    "community": "community",
+                    "channel": "channel",
+                    "protocol": "technology",
+                    "framework": "technology",
+                    "infrastructure": "technology",
+                    "model": "technology",
+                    "open-source-project": "project",
+                    "technique": "technology",
+                    "convergence": "technology",
+                }.get(etype)
+                if role:
+                    roles.setdefault(name, set()).add(role)
+
+        # Add channel as a role when explicitly observed
+        for obs in observations:
+            for ref in obs.get("item", {}).get("entity_refs", []):
+                name = ref["name"]
+                if ref["type"] == "channel":
+                    roles.setdefault(name, set()).add("channel")
+
+        # Relationships: convergence pairs, and channel/entity co-occurrence
+        relationships = []
+        # 1. Convergence signals become explicit relationships
+        for s in signals:
+            if s["kind"] == "convergence":
+                a, b = s["entity"].split(" + ", 1)
+                relationships.append({
+                    "id": _stable_id("rel", a, b, "convergence"),
+                    "from": a, "to": b, "type": "convergence",
+                    "inference": True, "strength": s["strength"],
+                    "evidence": [{"url": ev["url"]} for ev in s["evidence"][:3]],
                 })
+
+        # 2. Channel -> entity relationships from observations
+        channel_entities = {}
+        for obs in observations:
+            item = obs.get("item", {})
+            channel = item.get("channel")
+            if not channel:
+                continue
+            for ref in item.get("entity_refs", []):
+                channel_entities.setdefault(channel, set()).add(ref["name"])
+        for channel, ent_names in channel_entities.items():
+            for ent in ent_names:
+                relationships.append({
+                    "id": _stable_id("rel", f"channel:{channel}", ent, "mentioned_in"),
+                    "from": f"channel:{channel}", "to": ent, "type": "mentioned_in",
+                    "inference": True,
+                    "evidence": [],
+                })
+
+        # Trends: convert Trend objects to dicts with stable IDs
+        # (TrendHistory.trends() already returns Trend objects with .to_dict())
+        # trends passed as parameter
+
+        # Build final Brain 3 payload with entities (enriched with roles), signals, relationships, trends
+        for name, meta in ents.items():
+            if name in roles:
+                meta["roles"] = sorted(roles[name])
+
+        # Convert Trend objects to dicts
+        trend_dicts = [t.to_dict() if hasattr(t, "to_dict") else t for t in trends]
+
+        payload = {
+            "entities": ents,
+            "signals": [{"id": s["id"], "entity": s["entity"], "kind": s["kind"],
+                         "strength": s["strength"], "ts": s["last_seen"]}
+                        for s in signals[:50]],
+            "relationships": relationships,
+            "trends": trend_dicts,
+        }
+        if ents or relationships or trend_dicts:
+            try:
+                r = _post(f"{BRAIN_URL}/brain3", payload)
                 result["brain3"] = r.get("added", 0)
             except Exception as e:
                 result["errors"].append(f"brain3: {e}")
@@ -249,13 +290,13 @@ class Workspace:
 
     # --------------------------------------------------------- queries ----
     def signals(self, kind: str | None = None, limit: int = 20) -> list[dict]:
-        rows = self.store.read(SIGNALS, [])
+        rows = self._snapshot().get("signals", [])
         if kind:
             rows = [r for r in rows if r["kind"] == kind]
         return rows[:limit]
 
     def opportunities(self, kind: str | None = None, limit: int = 20) -> list[dict]:
-        rows = self.store.read(OPPORTUNITIES, [])
+        rows = self._snapshot().get("opportunities", [])
         if kind:
             rows = [r for r in rows if r["kind"] == kind]
         return rows[:limit]
@@ -276,8 +317,11 @@ class Workspace:
         rows.sort(key=lambda r: (r["mean_mentions"], r["total_mentions"]), reverse=True)
         return rows[:limit]
 
+    def evaluations(self, limit: int = 20) -> list[dict]:
+        return self._snapshot().get("evaluations", [])[:limit]
+
     def last_run(self) -> dict:
-        return self.store.read(LAST_RUN, {})
+        return self._snapshot().get("last_run", {})
 
 
 if __name__ == "__main__":

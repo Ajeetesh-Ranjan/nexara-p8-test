@@ -15,7 +15,12 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, "/app")
-sys.path.insert(0, "/app/research-fabric")
+# The Phase 8 pipeline lives in <repo>/research-fabric. In Docker that is
+# /app/research-fabric; running natively it is relative to this file.
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+for _p in ("/app/research-fabric", os.path.join(_REPO, "research-fabric")):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from services.common.service import Service
 from services.common.store import StateStore

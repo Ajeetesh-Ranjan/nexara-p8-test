@@ -10,11 +10,14 @@ import os
 import sys
 import threading
 import time
+from functools import wraps
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, "/app")
 
 from services.common.service import Service
 from services.world_intelligence.workspace import Workspace
+from services.world_intelligence.registry import IntelligenceRegistry
 
 DATA = os.environ.get("NEXARA_DATA", "/data")
 WI_DIR = os.path.join(DATA, "world-intelligence")
@@ -23,9 +26,33 @@ AUTO_START = os.environ.get("NEXARA_WI_AUTOSTART", "1") == "1"
 
 svc = Service("world-intelligence")
 ws = Workspace(WI_DIR)
+registry = IntelligenceRegistry(WI_DIR)
 
 _lock = threading.Lock()
 _running = False
+
+
+def _limit(query, default=20):
+    values = query.get("limit", [str(default)])
+    if (len(values) != 1 or not isinstance(values[0], str)
+            or not 1 <= len(values[0]) <= 3 or not values[0].isascii()
+            or not values[0].isdigit() or not 1 <= int(values[0]) <= 100):
+        raise ValueError("limit must be one integer from 1 to 100")
+    return int(values[0])
+
+
+def _bounded(fn):
+    @wraps(fn)
+    def checked(handler, query):
+        # The shared service parser drops blank values; preserve them here.
+        if handler is not None and hasattr(handler, "path"):
+            query = parse_qs(urlsplit(handler.path).query, keep_blank_values=True)
+        try:
+            _limit(query)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return fn(handler, query)
+    return checked
 
 
 @svc.readiness
@@ -66,10 +93,34 @@ def cycle_status(handler, query):
                  "last_run": ws.last_run()}
 
 
+def _view(key, rows, **extra):
+    """Preserve stored evidence; collection recency is not row-level freshness."""
+    last = ws.last_run()
+    stamp = last.get("started_at")
+    age = max(0, time.time() - stamp) if isinstance(stamp, (int, float)) else None
+    stale = age is None or age > max(1, CYCLE_INTERVAL) * 2
+    reports = last.get("sources", [])
+    failures = [r for r in reports if r.get("configured", True) and not r.get("ok")]
+    status = "never_collected" if not last else ("stale" if stale else "recent")
+    if last.get("error") or failures:
+        status = "partial_failure" if any(r.get("ok") for r in reports) else "failed"
+    return {"count": len(rows), key: rows, "last_run": last,
+            "freshness": {"status": status, "stale": stale,
+                          "age_seconds": round(age, 1) if age is not None else None,
+                          "note": "Collection recency only; inspect retained/is_live_data and row evidence."},
+            **extra}
+
+
+@svc.route("GET", "/risks")
+def risks(handler, query):
+    return 200, _view("risks", ws.signals(kind="risk", limit=_limit(query)),
+                      caveat="Explicit risk-language signals, not confirmed incidents.")
+
+
 @svc.route("GET", "/signals")
 def signals(handler, query):
     kind = (query.get("kind") or [None])[0]
-    limit = int((query.get("limit") or ["20"])[0])
+    limit = _limit(query)
     rows = ws.signals(kind, limit)
     return 200, {"count": len(rows), "signals": rows}
 
@@ -77,14 +128,14 @@ def signals(handler, query):
 @svc.route("GET", "/opportunities")
 def opportunities(handler, query):
     kind = (query.get("kind") or [None])[0]
-    limit = int((query.get("limit") or ["20"])[0])
+    limit = _limit(query)
     rows = ws.opportunities(kind, limit)
     return 200, {"count": len(rows), "opportunities": rows}
 
 
 @svc.route("GET", "/accelerating")
 def accelerating(handler, query):
-    limit = int((query.get("limit") or ["15"])[0])
+    limit = _limit(query, 15)
     return 200, {"entities": ws.accelerating(limit)}
 
 
@@ -128,19 +179,34 @@ def matters(handler, query):
 
 @svc.route("GET", "/ask/opportunities")
 def ask_opps(handler, query):
-    rows = ws.opportunities(limit=15)
+    kind = (query.get("kind") or [None])[0]
+    rows = ws.opportunities(kind=kind, limit=_limit(query, 15))
     return 200, {
         "question": "What opportunities exist?",
         "caveat": "Every item is a hypothesis derived from discussion volume, "
                   "not validated value. Confidence is capped at 0.85.",
-        "opportunities": [
-            {"title": o["title"], "kind": o["kind"], "confidence": o["confidence"],
-             "thesis": o["thesis"], "next_step": o["next_step"],
-             "risks": o["risks"], "sources": o["distinct_sources"],
-             "evidence": o["evidence"][:3]}
-            for o in rows
-        ],
+        "opportunities": rows,
     }
+
+
+OPPORTUNITY_CAVEAT = ("Every opportunity is an unvalidated hypothesis. Scores rank validation "
+                      "priority, not monetary value; monetary_estimate is null and "
+                      "confidence is capped at 0.85.")
+
+
+@svc.route("GET", "/ask/build")
+def build(handler, query):
+    return 200, _view("opportunities", ws.opportunities(kind="build", limit=_limit(query)),
+                      question="What should we build?", caveat=OPPORTUNITY_CAVEAT)
+
+
+@svc.route("GET", "/ask/highest-value")
+def highest_value(handler, query):
+    # Workspace filters and ranks BEFORE applying limit; never rerank a truncated page.
+    return 200, _view("opportunities", ws.opportunities(limit=_limit(query)),
+                      question="Show highest-value opportunities",
+                      basis="scores.overall descending; not an ROI or revenue estimate",
+                      caveat=OPPORTUNITY_CAVEAT)
 
 
 @svc.route("GET", "/ask/threats")
@@ -203,15 +269,75 @@ def ask_accel(handler, query):
 @svc.route("GET", "/ask/companies")
 def companies(handler, query):
     sigs = [s for s in ws.signals(limit=200) if s["entity_type"] == "company"]
-    return 200, {
-        "question": "Which companies should we watch?",
-        "companies": [
-            {"company": s["entity"], "kind": s["kind"], "strength": s["strength"],
-             "mentions": s["mentions"], "sources": s["source_names"],
-             "evidence": s["evidence"][:2]}
-            for s in sigs[:12]
-        ],
-    }
+    return 200, _view("communities", sigs[:12],
+                      question="Which companies should we watch?",
+                      caveat="Post attention, not membership counts. Source quality varies.")
+
+
+@svc.route("GET", "/ask/communities")
+def communities(handler, query):
+    sigs = [s for s in ws.signals(limit=200) if s["entity_type"] == "company"]
+    return 200, _view("communities", sigs[:12],
+                      question="What communities are growing?",
+                      caveat="Post attention, not membership counts. Source quality varies.")
+
+
+# ------------------------- Registry management endpoints ---------------------
+
+def _registry_write(handler, resource):
+    """Validate JSON shapes before invoking the registry's domain validation."""
+    try:
+        payload = handler.read_json()
+        if not isinstance(payload, dict):
+            raise ValueError("registry input must be a JSON object")
+        required = (("id", "username", "url", "category", "publisher", "description")
+                    if resource == "channels" else ("id", "name"))
+        for field in required:
+            if not isinstance(payload.get(field), str) or not payload[field].strip():
+                raise ValueError(f"{field} must be a nonempty string")
+        list_field = "topics" if resource == "channels" else "keywords"
+        values = payload.get(list_field, [])
+        if not isinstance(values, list) or any(
+                not isinstance(v, str) or not v.strip() for v in values):
+            raise ValueError(f"{list_field} must be a list of nonempty strings")
+        if resource == "channels":
+            registry.upsert_channel(payload)
+        else:
+            registry.upsert_topic(payload)
+    except (ValueError, TypeError, KeyError) as exc:
+        return 400, {"error": str(exc)}
+    return 200, {"status": "ok"}
+
+@svc.route("GET", "/registry/channels")
+def registry_channels(handler, query):
+    """List all registered channels."""
+    limit = _limit(query, 50)
+    return 200, {"channels": registry.channels()[:limit]}
+
+
+@svc.route("POST", "/registry/channels")
+def registry_channels_add(handler, query):
+    """Internal use only: upsert a channel dict."""
+    return _registry_write(handler, "channels")
+
+
+@svc.route("GET", "/registry/topics")
+def registry_topics(handler, query):
+    """List all registered topics."""
+    limit = _limit(query, 50)
+    return 200, {"topics": registry.topics()[:limit]}
+
+
+@svc.route("POST", "/registry/topics")
+def registry_topics_add(handler, query):
+    """Internal use only: upsert a topic dict."""
+    return _registry_write(handler, "topics")
+
+
+# Apply limit validation to all intelligence reads, including legacy routes.
+for _key, _fn in list(svc.routes.items()):
+    if _key[0] == "GET":
+        svc.routes[_key] = _bounded(_fn)
 
 
 def _loop():

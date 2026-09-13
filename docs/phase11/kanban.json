@@ -1,0 +1,38 @@
+{
+  "board": "default",
+  "epic": "t_5dfa3cb0",
+  "work": [
+    {
+      "key": "telegram",
+      "id": "t_69505ac8",
+      "title": "P11 \u2014 Telegram channel/topic registry and selective ingestion",
+      "assignee": "default",
+      "status": "running",
+      "epic": "t_5dfa3cb0"
+    },
+    {
+      "key": "engine",
+      "id": "t_3f3c7eec",
+      "title": "P11 \u2014 Signal evaluation and opportunity scoring",
+      "assignee": "default",
+      "status": "running",
+      "epic": "t_5dfa3cb0"
+    },
+    {
+      "key": "integration",
+      "id": "t_7c4236cb",
+      "title": "P11 \u2014 Brain projections and honest time-window trends",
+      "assignee": "default",
+      "status": "running",
+      "epic": "t_5dfa3cb0"
+    },
+    {
+      "key": "surfaces",
+      "id": "t_ce67745a",
+      "title": "P11 \u2014 Primary CLI and six read-only intelligence views",
+      "assignee": "default",
+      "status": "running",
+      "epic": "t_5dfa3cb0"
+    }
+  ]
+}

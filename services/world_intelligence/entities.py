@@ -200,6 +200,8 @@ _GENERIC_SINGLE = {
 _GITHUB_REPO = re.compile(r"(?<![\w/])([A-Za-z0-9][\w.-]{0,38})/([A-Za-z0-9][\w.-]{0,99})(?![\w/])")
 _CAP_PHRASE = re.compile(r"\b([A-Z][a-zA-Z0-9]{2,}(?:\s+[A-Z][a-zA-Z0-9]{2,}){0,3})\b")
 _URL = re.compile(r"https?://\S+")
+# Search qualifiers from collector queries (topic:ai, stars:>50, cat:cs.AI)
+_QUALIFIER = re.compile(r"\b\w+:[<>=]?[\w.:>-]+")
 
 
 @dataclass
@@ -217,7 +219,7 @@ def extract(text: str, url: str = "", max_heuristic: int = 4) -> list[ExtractedE
         return []
 
     found: dict[str, ExtractedEntity] = {}
-    clean = _URL.sub(" ", text)
+    clean = _QUALIFIER.sub(" ", _URL.sub(" ", text))
 
     # 1. lexicon — highest precision
     for alias, pat in _ALIAS_PATTERNS:

@@ -34,6 +34,8 @@ services:
     <<: *common
     container_name: nexara-brain
     command: ["python", "-m", "services.brain_runtime.main"]
+    ports:
+      - "${NEXARA_BIND:-127.0.0.1}:8081:8081"
     environment:
       <<: *common-env
       PORT: 8081
@@ -50,6 +52,8 @@ services:
     <<: *common
     container_name: nexara-relay
     command: ["python", "-m", "services.relay.main"]
+    ports:
+      - "${NEXARA_BIND:-127.0.0.1}:8082:8082"
     environment:
       <<: *common-env
       PORT: 8082
@@ -67,6 +71,8 @@ services:
     <<: *common
     container_name: nexara-research
     command: ["python", "-m", "services.research_fabric.main"]
+    ports:
+      - "${NEXARA_BIND:-127.0.0.1}:8083:8083"
     environment:
       <<: *common-env
       PORT: 8083
@@ -85,6 +91,8 @@ services:
     <<: *common
     container_name: nexara-shared
     command: ["python", "-m", "services.shared_brain.main"]
+    ports:
+      - "${NEXARA_BIND:-127.0.0.1}:8084:8084"
     environment:
       <<: *common-env
       PORT: 8084
@@ -105,6 +113,8 @@ services:
     <<: *common
     container_name: nexara-infra
     command: ["python", "-m", "services.infrastructure.main"]
+    ports:
+      - "${NEXARA_BIND:-127.0.0.1}:8085:8085"
     environment:
       <<: *common-env
       PORT: 8085
@@ -140,6 +150,8 @@ services:
     <<: *common
     container_name: nexara-worldint
     command: ["python", "-m", "services.world_intelligence.main"]
+    ports:
+      - "${NEXARA_BIND:-127.0.0.1}:8086:8086"
     environment:
       <<: *common-env
       PORT: 8086

@@ -62,10 +62,13 @@ def brain2_add(handler, query):
     def mutate(current):
         if not isinstance(current, list):
             current = []
-        # idempotent on artifact_id
+        # An artifact is an evolving finding, not an append-only duplicate.
         aid = entry.get("artifact_id")
-        if aid and any(e.get("artifact_id") == aid for e in current):
-            return current
+        for index, prior in enumerate(current):
+            if aid and prior.get("artifact_id") == aid:
+                current[index] = {**prior, **entry,
+                    "sources": list(dict.fromkeys(prior.get("sources", []) + entry.get("sources", [])))}
+                return current
         current.append(entry)
         return current
 
@@ -106,12 +109,22 @@ def brain3_update(handler, query):
         added = 0
         now = time.strftime("%Y-%m-%dT%H:%M:%S")
         for name, meta in entities.items():
-            if name in model["entities"]:
-                model["entities"][name]["last_seen"] = now
-            else:
-                model["entities"][name] = {**meta, "first_seen": now, "last_seen": now}
+            prior = model["entities"].get(name, {})
+            model["entities"][name] = {**prior, **meta,
+                "first_seen": prior.get("first_seen", now), "last_seen": meta.get("last_seen", now)}
+            model["entities"][name]["sources"] = list(dict.fromkeys(
+                prior.get("sources", []) + meta.get("sources", [])))
+            if not prior:
                 added += 1
-        model["signals"].extend(signals)
+        # Upsert all projections; replays never create extra graph facts.
+        for field, incoming in (("signals", signals),
+                                ("relationships", payload.get("relationships", [])),
+                                ("trends", payload.get("trends", []))):
+            indexed = {}
+            for row in model.get(field, []) + incoming:
+                key = row.get("id") or repr(sorted(row.items()))
+                indexed[key] = {**indexed.get(key, {}), **row}
+            model[field] = list(indexed.values())
         model["updated_at"] = now
         model["_last_added"] = added
         return model

@@ -25,6 +25,6 @@ RUN useradd --create-home --uid 10001 nexara \
  && chown -R nexara:nexara /app /data /backups
 USER nexara
 
-EXPOSE 8080 8081 8082 8083 8084 8085
+EXPOSE 8080 8081 8082 8083 8084 8085 8086
 
 CMD ["python", "-m", "services.brain_runtime.main"]
